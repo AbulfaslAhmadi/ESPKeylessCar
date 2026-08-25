@@ -1,353 +1,365 @@
 /*
- * Web Server Module - Dashboard and API endpoints
- * Uses standard WebServer (not AsyncWebServer) for lower RAM usage
+ * WiFi Manager - WiFi client with AP setup mode and NTP sync
+ * First boot: Creates AP "ESP32-Keyless-Setup" for WiFi configuration
+ * After config: Connects as client to configured network
  */
 
-#ifndef WEB_SERVER_H
-#define WEB_SERVER_H
+#ifndef WIFI_MANAGER_H
+#define WIFI_MANAGER_H
 
+#include <WiFi.h>
 #include <WebServer.h>
-#include "storage.h"
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <time.h>
+#include <esp_task_wdt.h>
 #include "audit_log.h"
-#include "wifi_manager.h"
 
-// External references to global settings variables in main.cpp
-extern int RSSI_TRIGGER_THRESHOLD;
-extern unsigned long TRIGGER_DURATION_MS;
-extern unsigned long PROXIMITY_TIMEOUT;
-extern int WEAK_SIGNAL_THRESHOLD;
+// AP Configuration
+#define AP_SSID "ESP32-Keyless-Setup"
+#define AP_PASS "keyless123"
 
-// HTML Dashboard (minified, stored in PROGMEM)
-const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
+// NTP configuration
+#define NTP_SERVER "pool.ntp.org"
+#define GMT_OFFSET_SEC 3600      // UTC+1 (Germany)
+#define DAYLIGHT_OFFSET_SEC 3600 // Daylight saving time
+
+// Reconnect settings
+#define WIFI_RECONNECT_INTERVAL 30000
+#define WIFI_CONNECT_TIMEOUT 15000
+
+// Setup portal HTML
+const char SETUP_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32 Keyless</title>
+<title>ESP32 Keyless - WiFi Setup</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,-apple-system,sans-serif;background:#1a1a2e;color:#eee;padding:16px;max-width:600px;margin:0 auto}
-h1{font-size:1.4em;margin-bottom:16px;color:#4cc9f0}
-h2{font-size:1.1em;margin:20px 0 10px;color:#7b2cbf}
-.card{background:#16213e;border-radius:8px;padding:12px;margin-bottom:12px}
-.device{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #0f3460}
-.device:last-child{border:none}
-.device-name{flex:1}
-.device-name input{background:#0f3460;border:1px solid #4cc9f0;color:#eee;padding:4px 8px;border-radius:4px;width:140px}
-.btn{background:#4cc9f0;color:#1a1a2e;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.9em;margin-left:6px}
+body{font-family:system-ui,-apple-system,sans-serif;background:#1a1a2e;color:#eee;padding:20px;max-width:400px;margin:0 auto}
+h1{font-size:1.3em;margin-bottom:20px;color:#4cc9f0;text-align:center}
+.card{background:#16213e;border-radius:8px;padding:16px;margin-bottom:16px}
+label{display:block;margin-bottom:6px;font-size:0.9em;color:#888}
+input,select{width:100%;padding:10px;margin-bottom:12px;border:1px solid #4cc9f0;border-radius:4px;background:#0f3460;color:#eee;font-size:1em}
+select{cursor:pointer}
+.btn{width:100%;background:#4cc9f0;color:#1a1a2e;border:none;padding:12px;border-radius:4px;cursor:pointer;font-size:1em;font-weight:bold}
 .btn:hover{background:#3aa8d8}
-.btn-del{background:#e63946}
-.btn-del:hover{background:#c92a36}
-.btn-save{background:#2d6a4f}
-.btn-save:hover{background:#1e4d3a}
-.log-entry{display:flex;padding:6px 0;border-bottom:1px solid #0f3460;font-size:0.9em}
-.log-entry:last-child{border:none}
-.log-time{width:70px;color:#888}
-.log-device{flex:1}
-.log-action{width:60px;text-align:center;border-radius:4px;padding:2px 6px}
-.log-unlock{background:#2d6a4f;color:#fff}
-.log-lock{background:#9d0208;color:#fff}
-.log-rssi{width:50px;text-align:right;color:#888}
-.status{display:flex;gap:16px;font-size:0.85em;color:#888;margin-bottom:16px}
-.status span{background:#0f3460;padding:4px 10px;border-radius:4px}
-.empty{color:#666;font-style:italic;padding:10px 0}
-#msg{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#2d6a4f;padding:10px 20px;border-radius:8px;display:none}
-.setting{margin:12px 0}
-.setting label{display:block;margin-bottom:4px;font-size:0.9em}
-.setting input[type=range]{width:100%;margin:4px 0}
-.setting .val{float:right;color:#4cc9f0;font-weight:bold}
-.setting small{color:#666;font-size:0.8em}
+.btn:disabled{background:#666;cursor:not-allowed}
+.info{font-size:0.8em;color:#666;text-align:center;margin-top:16px}
+.scanning{color:#4cc9f0;text-align:center;padding:20px}
+.network{padding:8px;margin:4px 0;background:#0f3460;border-radius:4px;cursor:pointer;display:flex;justify-content:space-between}
+.network:hover{background:#1a3a6e}
+.signal{color:#4cc9f0;font-size:0.9em}
+#status{margin-top:12px;padding:10px;border-radius:4px;text-align:center;display:none}
+.success{background:#2d6a4f;display:block!important}
+.error{background:#9d0208;display:block!important}
 </style>
 </head><body>
-<h1>ESP32 Keyless Dashboard</h1>
-<div class="status">
-<span id="wifi">WiFi: --</span>
-<span id="uptime">Uptime: --</span>
+<h1>ESP32 Keyless<br>WiFi Setup</h1>
+<div class="card">
+<div id="networks"><div class="scanning">Scanning networks...</div></div>
 </div>
-<h2>Devices</h2>
-<div class="card" id="devices"><div class="empty">Loading...</div></div>
-<h2>Settings</h2>
-<div class="card" id="settings">
-<div class="setting">
-<label>Trigger RSSI Threshold <span class="val" id="v1">-80</span> dBm</label>
-<input type="range" id="s1" min="-100" max="-50" value="-80" oninput="$('v1').textContent=this.value">
-<small>Signal strength that fires the pins once (lower = longer range)</small>
+<div class="card">
+<form id="form" onsubmit="return save()">
+<label>WiFi Network (SSID)</label>
+<input type="text" id="ssid" required placeholder="Select from list or type manually">
+<label>Password</label>
+<input type="password" id="pass" placeholder="WiFi password">
+<button type="submit" class="btn" id="btn">Connect</button>
+<div id="status"></div>
+</form>
 </div>
-<div class="setting">
-<label>Trigger Duration <span class="val" id="v2">3</span> sec</label>
-<input type="range" id="s2" min="1" max="10" value="3" oninput="$('v2').textContent=this.value">
-<small>How long the pins stay HIGH after firing (1-10 sec)</small>
-</div>
-<div class="setting">
-<label>Device Timeout <span class="val" id="v3">10</span> sec</label>
-<input type="range" id="s3" min="5" max="60" value="10" oninput="$('v3').textContent=this.value">
-<small>Fallback: re-arm if no BLE advert is seen for this long</small>
-</div>
-<div class="setting">
-<label>Weak Signal Count <span class="val" id="v4">3</span></label>
-<input type="range" id="s4" min="1" max="10" value="3" oninput="$('v4').textContent=this.value">
-<small>Number of weak readings before re-arming for the next approach</small>
-</div>
-<button class="btn btn-save" onclick="saveSettings()" style="width:100%;margin-top:8px">Save Settings</button>
-</div>
-<h2>Activity Log</h2>
-<div class="card" id="log"><div class="empty">Loading...</div></div>
-<div id="msg"></div>
+<div class="info">After connecting, the device will restart<br>and connect to your WiFi network.</div>
 <script>
-function $(s){return document.getElementById(s)}
-function msg(t){let m=$('msg');m.textContent=t;m.style.display='block';setTimeout(()=>m.style.display='none',2000)}
-function load(){
-fetch('/api/status').then(r=>r.json()).then(d=>{
-$('wifi').textContent='WiFi: '+(d.wifi?d.ip:'Offline');
-$('uptime').textContent='Uptime: '+d.uptime;
-});
-fetch('/api/devices').then(r=>r.json()).then(d=>{
+function scan(){
+fetch('/scan').then(r=>r.json()).then(d=>{
 let h='';
-d.devices.forEach((dev,i)=>{
-if(dev.active){
-h+='<div class="device"><div class="device-name"><input id="n'+i+'" value="'+dev.name+'" maxlength="19"></div>';
-h+='<button class="btn" onclick="rename('+i+')">Save</button>';
-h+='<button class="btn btn-del" onclick="del('+i+')">X</button></div>';
-}
+d.networks.forEach(n=>{
+h+='<div class="network" onclick="sel(\''+n.ssid+'\')"><span>'+n.ssid+'</span><span class="signal">'+n.rssi+' dBm</span></div>';
 });
-$('devices').innerHTML=h||'<div class="empty">No devices paired</div>';
-});
-fetch('/api/log').then(r=>r.json()).then(d=>{
-let h='';
-d.log.slice().reverse().forEach(e=>{
-h+='<div class="log-entry"><span class="log-time">'+e.time+'</span>';
-h+='<span class="log-device">'+e.device+'</span>';
-h+='<span class="log-action log-'+e.action.toLowerCase()+'">'+e.action+'</span>';
-h+='<span class="log-rssi">'+e.rssi+'dB</span></div>';
-});
-$('log').innerHTML=h||'<div class="empty">No activity yet</div>';
-});
-fetch('/api/settings').then(r=>r.json()).then(d=>{
-$('s1').value=d.rssiTrigger;$('v1').textContent=d.rssiTrigger;
-$('s2').value=d.triggerDuration;$('v2').textContent=d.triggerDuration;
-$('s3').value=d.timeout;$('v3').textContent=d.timeout;
-$('s4').value=d.weakCount;$('v4').textContent=d.weakCount;
+document.getElementById('networks').innerHTML=h||'<div class="scanning">No networks found</div>';
+}).catch(()=>{
+document.getElementById('networks').innerHTML='<div class="scanning">Scan failed - refresh page</div>';
 });
 }
-function rename(i){
-let n=$('n'+i).value;
-fetch('/api/devices/'+i+'/name',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'name='+encodeURIComponent(n)})
-.then(r=>{if(r.ok)msg('Saved!');else msg('Error');load();});
+function sel(s){document.getElementById('ssid').value=s;}
+function save(){
+let ssid=document.getElementById('ssid').value;
+let pass=document.getElementById('pass').value;
+let btn=document.getElementById('btn');
+let status=document.getElementById('status');
+btn.disabled=true;btn.textContent='Connecting...';
+status.className='';status.style.display='none';
+fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+body:'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass)})
+.then(r=>r.json()).then(d=>{
+if(d.success){
+status.textContent='Connected! Restarting...';
+status.className='success';
+}else{
+status.textContent='Connection failed: '+d.error;
+status.className='error';
+btn.disabled=false;btn.textContent='Connect';
 }
-function del(i){
-if(!confirm('Delete this device?'))return;
-fetch('/api/devices/'+i,{method:'DELETE'}).then(r=>{if(r.ok)msg('Deleted');load();});
+}).catch(()=>{
+status.textContent='Error - try again';
+status.className='error';
+btn.disabled=false;btn.textContent='Connect';
+});
+return false;
 }
-function saveSettings(){
-let body='rssiTrigger='+$('s1').value+'&triggerDuration='+$('s2').value+'&timeout='+$('s3').value+'&weakCount='+$('s4').value;
-fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
-.then(r=>{if(r.ok)msg('Settings saved!');else msg('Error');});
-}
-load();setInterval(load,10000);
+scan();
 </script>
 </body></html>
 )rawliteral";
 
-class DashboardServer {
+class WifiManager {
 private:
-    WebServer server;
-    Storage* storage;
+    Preferences wifiPrefs;
     AuditLog* auditLog;
-    WifiManager* wifiManager;
-    unsigned long startTime;
+    WebServer* setupServer = nullptr;
+    DNSServer* dnsServer = nullptr;
 
-public:
-    DashboardServer() : server(80) {}
+    bool configured = false;
+    bool connected = false;
+    bool apMode = false;
+    bool ntpInitialized = false;
+    unsigned long lastReconnectAttempt = 0;
+    unsigned long connectStartTime = 0;
+    bool connecting = false;
 
-    void begin(Storage* storagePtr, AuditLog* logPtr, WifiManager* wifiPtr) {
-        storage = storagePtr;
-        auditLog = logPtr;
-        wifiManager = wifiPtr;
-        startTime = millis();
+    String storedSSID = "";
+    String storedPass = "";
 
-        // Dashboard
-        server.on("/", HTTP_GET, [this]() {
-            server.send_P(200, "text/html", DASHBOARD_HTML);
+    void loadCredentials() {
+        wifiPrefs.begin("wificreds", true);  // Read-only
+        storedSSID = wifiPrefs.getString("ssid", "");
+        storedPass = wifiPrefs.getString("pass", "");
+        wifiPrefs.end();
+
+        configured = (storedSSID.length() > 0);
+        Serial.printf("WiFi credentials %s\n", configured ? "found" : "not found");
+    }
+
+    void saveCredentials(const String& ssid, const String& pass) {
+        wifiPrefs.begin("wificreds", false);
+        wifiPrefs.putString("ssid", ssid);
+        wifiPrefs.putString("pass", pass);
+        wifiPrefs.end();
+
+        storedSSID = ssid;
+        storedPass = pass;
+        configured = true;
+        Serial.printf("WiFi credentials saved for: %s\n", ssid.c_str());
+    }
+
+    void startAPMode() {
+        apMode = true;
+        Serial.println("Starting WiFi Setup AP...");
+
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP(AP_SSID, AP_PASS);
+
+        IPAddress apIP = WiFi.softAPIP();
+        Serial.printf("AP started: %s\n", AP_SSID);
+        Serial.printf("Password: %s\n", AP_PASS);
+        Serial.printf("Config URL: http://%s/\n", apIP.toString().c_str());
+
+        // DNS server for captive portal
+        dnsServer = new DNSServer();
+        dnsServer->start(53, "*", apIP);
+
+        // Setup web server
+        setupServer = new WebServer(80);
+
+        setupServer->on("/", HTTP_GET, [this]() {
+            setupServer->send_P(200, "text/html", SETUP_HTML);
         });
 
-        // API: Get all devices
-        server.on("/api/devices", HTTP_GET, [this]() {
-            String json = "{\"devices\":[";
-            for (int i = 0; i < storage->deviceCount; i++) {
+        setupServer->on("/scan", HTTP_GET, [this]() {
+            String json = "{\"networks\":[";
+            int n = WiFi.scanNetworks();
+            for (int i = 0; i < n; i++) {
                 if (i > 0) json += ",";
-                json += "{\"id\":";
-                json += i;
-                json += ",\"name\":\"";
-                json += storage->devices[i].name;
-                json += "\",\"active\":";
-                json += storage->devices[i].active ? "true" : "false";
+                json += "{\"ssid\":\"";
+                json += WiFi.SSID(i);
+                json += "\",\"rssi\":";
+                json += WiFi.RSSI(i);
                 json += "}";
             }
             json += "]}";
-            server.send(200, "application/json", json);
+            setupServer->send(200, "application/json", json);
         });
 
-        // API: Rename device
-        server.on("/api/devices/0/name", HTTP_POST, [this]() { handleRename(0); });
-        server.on("/api/devices/1/name", HTTP_POST, [this]() { handleRename(1); });
-        server.on("/api/devices/2/name", HTTP_POST, [this]() { handleRename(2); });
-        server.on("/api/devices/3/name", HTTP_POST, [this]() { handleRename(3); });
-        server.on("/api/devices/4/name", HTTP_POST, [this]() { handleRename(4); });
-        server.on("/api/devices/5/name", HTTP_POST, [this]() { handleRename(5); });
-        server.on("/api/devices/6/name", HTTP_POST, [this]() { handleRename(6); });
-        server.on("/api/devices/7/name", HTTP_POST, [this]() { handleRename(7); });
-        server.on("/api/devices/8/name", HTTP_POST, [this]() { handleRename(8); });
-        server.on("/api/devices/9/name", HTTP_POST, [this]() { handleRename(9); });
+        setupServer->on("/save", HTTP_POST, [this]() {
+            String ssid = setupServer->arg("ssid");
+            String pass = setupServer->arg("pass");
 
-        // API: Delete device
-        server.on("/api/devices/0", HTTP_DELETE, [this]() { handleDelete(0); });
-        server.on("/api/devices/1", HTTP_DELETE, [this]() { handleDelete(1); });
-        server.on("/api/devices/2", HTTP_DELETE, [this]() { handleDelete(2); });
-        server.on("/api/devices/3", HTTP_DELETE, [this]() { handleDelete(3); });
-        server.on("/api/devices/4", HTTP_DELETE, [this]() { handleDelete(4); });
-        server.on("/api/devices/5", HTTP_DELETE, [this]() { handleDelete(5); });
-        server.on("/api/devices/6", HTTP_DELETE, [this]() { handleDelete(6); });
-        server.on("/api/devices/7", HTTP_DELETE, [this]() { handleDelete(7); });
-        server.on("/api/devices/8", HTTP_DELETE, [this]() { handleDelete(8); });
-        server.on("/api/devices/9", HTTP_DELETE, [this]() { handleDelete(9); });
-
-        // API: Get log
-        server.on("/api/log", HTTP_GET, [this]() {
-            LogEntry entries[MAX_LOG_ENTRIES];
-            int count = storage->getLogEntries(entries, MAX_LOG_ENTRIES);
-
-            String json = "{\"log\":[";
-            for (int i = 0; i < count; i++) {
-                if (i > 0) json += ",";
-
-                char entryJson[128];
-                const char* deviceName = "Unknown";
-                if (entries[i].deviceIndex < storage->deviceCount) {
-                    deviceName = storage->devices[entries[i].deviceIndex].name;
-                }
-                auditLog->getLogEntryJson(&entries[i], entryJson, sizeof(entryJson), deviceName);
-                json += entryJson;
-            }
-            json += "]}";
-            server.send(200, "application/json", json);
-        });
-
-        // API: Get settings
-        server.on("/api/settings", HTTP_GET, [this]() {
-            String json = "{";
-            json += "\"rssiTrigger\":";
-            json += storage->settings.rssiTriggerThreshold;
-            json += ",\"triggerDuration\":";
-            json += storage->settings.triggerDurationSec;
-            json += ",\"timeout\":";
-            json += storage->settings.proximityTimeout;
-            json += ",\"weakCount\":";
-            json += storage->settings.weakSignalThreshold;
-            json += "}";
-            server.send(200, "application/json", json);
-        });
-
-        // API: Save settings
-        server.on("/api/settings", HTTP_POST, [this]() {
-            bool changed = false;
-
-            if (server.hasArg("rssiTrigger")) {
-                storage->settings.rssiTriggerThreshold = server.arg("rssiTrigger").toInt();
-                changed = true;
-            }
-            if (server.hasArg("triggerDuration")) {
-                int d = server.arg("triggerDuration").toInt();
-                if (d < 1) d = 1;
-                if (d > 10) d = 10; // hard-clamped to the 1-10 sec range
-                storage->settings.triggerDurationSec = d;
-                changed = true;
-            }
-            if (server.hasArg("timeout")) {
-                storage->settings.proximityTimeout = server.arg("timeout").toInt();
-                changed = true;
-            }
-            if (server.hasArg("weakCount")) {
-                storage->settings.weakSignalThreshold = server.arg("weakCount").toInt();
-                changed = true;
+            if (ssid.length() == 0) {
+                setupServer->send(200, "application/json", "{\"success\":false,\"error\":\"SSID required\"}");
+                return;
             }
 
-            if (changed) {
-                storage->saveSettings();
+            // Try to connect
+            Serial.printf("Trying to connect to: %s\n", ssid.c_str());
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(ssid.c_str(), pass.c_str());
 
-                // Apply settings to global variables immediately
-                RSSI_TRIGGER_THRESHOLD = storage->settings.rssiTriggerThreshold;
-                TRIGGER_DURATION_MS = storage->settings.triggerDurationSec * 1000UL;
-                PROXIMITY_TIMEOUT = storage->settings.proximityTimeout * 1000UL;
-                WEAK_SIGNAL_THRESHOLD = storage->settings.weakSignalThreshold;
+            int attempts = 0;
+            while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+                esp_task_wdt_reset();  // Feed watchdog during connection
+                delay(500);
+                Serial.print(".");
+                attempts++;
+            }
+            Serial.println();
 
-                Serial.printf("Settings applied: Trigger=%d, Duration=%lums, Timeout=%lums, WeakThr=%d\n",
-                    RSSI_TRIGGER_THRESHOLD,
-                    TRIGGER_DURATION_MS,
-                    PROXIMITY_TIMEOUT,
-                    WEAK_SIGNAL_THRESHOLD);
-                server.send(200, "application/json", "{\"success\":true}");
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.printf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+                saveCredentials(ssid, pass);
+                setupServer->send(200, "application/json", "{\"success\":true}");
+                delay(1000);
+                ESP.restart();
             } else {
-                server.send(400, "application/json", "{\"error\":\"No settings provided\"}");
+                Serial.println("Connection failed");
+                WiFi.mode(WIFI_AP);
+                WiFi.softAP(AP_SSID, AP_PASS);
+                setupServer->send(200, "application/json", "{\"success\":false,\"error\":\"Could not connect\"}");
             }
         });
 
-        // API: System status
-        server.on("/api/status", HTTP_GET, [this]() {
-            unsigned long uptime = (millis() - startTime) / 1000;
-            unsigned long hours = uptime / 3600;
-            unsigned long minutes = (uptime % 3600) / 60;
-
-            String json = "{";
-            json += "\"wifi\":";
-            json += wifiManager->isConnected() ? "true" : "false";
-            json += ",\"ip\":\"";
-            json += wifiManager->ipAddress;
-            json += "\",\"uptime\":\"";
-            json += hours;
-            json += "h ";
-            json += minutes;
-            json += "m\",\"devices\":";
-            json += storage->deviceCount;
-            json += ",\"logEntries\":";
-            json += auditLog->getEntryCount();
-            json += ",\"ntpSynced\":";
-            json += auditLog->isNtpSynced() ? "true" : "false";
-            json += "}";
-
-            server.send(200, "application/json", json);
+        // Captive portal - redirect all requests
+        setupServer->onNotFound([this]() {
+            setupServer->sendHeader("Location", "/", true);
+            setupServer->send(302, "text/plain", "");
         });
 
-        server.begin();
-        Serial.println("Web server started on port 80");
+        setupServer->begin();
+        Serial.println("Setup portal started");
     }
 
-    void handleClient() {
-        server.handleClient();
-    }
+public:
+    String ipAddress = "";
 
-private:
-    void handleRename(int index) {
-        if (server.hasArg("name")) {
-            String newName = server.arg("name");
-            if (storage->renameDevice(index, newName.c_str())) {
-                server.send(200, "application/json", "{\"success\":true}");
-                Serial.printf("Device %d renamed to: %s\n", index, newName.c_str());
-            } else {
-                server.send(400, "application/json", "{\"error\":\"Invalid index\"}");
-            }
+    void begin(AuditLog* logPtr) {
+        auditLog = logPtr;
+        loadCredentials();
+
+        if (!configured) {
+            startAPMode();
         } else {
-            server.send(400, "application/json", "{\"error\":\"Missing name\"}");
+            WiFi.mode(WIFI_STA);
+            WiFi.setAutoReconnect(true);
+            Serial.printf("WiFi manager ready for: %s\n", storedSSID.c_str());
         }
     }
 
-    void handleDelete(int index) {
-        if (storage->deleteDevice(index)) {
-            server.send(200, "application/json", "{\"success\":true}");
-            Serial.printf("Device %d deleted\n", index);
-        } else {
-            server.send(400, "application/json", "{\"error\":\"Invalid index\"}");
+    void connect() {
+        if (apMode) return;  // Don't connect in AP mode
+
+        if (WiFi.status() == WL_CONNECTED) {
+            if (!connected) {
+                connected = true;
+                ipAddress = WiFi.localIP().toString();
+                Serial.printf("WiFi connected! IP: %s\n", ipAddress.c_str());
+                syncNTP();
+            }
+            return;
         }
+
+        if (!connecting && configured) {
+            Serial.printf("Connecting to WiFi '%s'...\n", storedSSID.c_str());
+            WiFi.begin(storedSSID.c_str(), storedPass.c_str());
+            connecting = true;
+            connectStartTime = millis();
+        }
+
+        if (connecting && (millis() - connectStartTime > WIFI_CONNECT_TIMEOUT)) {
+            connecting = false;
+            Serial.println("WiFi connection timeout");
+        }
+    }
+
+    void update() {
+        // Handle AP mode
+        if (apMode) {
+            if (dnsServer) dnsServer->processNextRequest();
+            if (setupServer) setupServer->handleClient();
+            return;
+        }
+
+        // Handle client mode
+        if (WiFi.status() == WL_CONNECTED) {
+            if (!connected) {
+                connected = true;
+                connecting = false;
+                ipAddress = WiFi.localIP().toString();
+                Serial.printf("WiFi connected! IP: %s\n", ipAddress.c_str());
+                syncNTP();
+            }
+        } else {
+            if (connected) {
+                connected = false;
+                ipAddress = "";
+                Serial.println("WiFi disconnected");
+            }
+
+            if (!connecting && (millis() - lastReconnectAttempt > WIFI_RECONNECT_INTERVAL)) {
+                lastReconnectAttempt = millis();
+                connect();
+            }
+        }
+    }
+
+    void syncNTP() {
+        if (ntpInitialized || !auditLog) return;
+
+        Serial.println("Syncing NTP time...");
+        configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+
+        struct tm timeinfo;
+        int retries = 0;
+        while (!getLocalTime(&timeinfo) && retries < 10) {
+            esp_task_wdt_reset();  // Feed watchdog during NTP sync
+            delay(500);
+            retries++;
+        }
+
+        if (retries < 10) {
+            time_t now;
+            time(&now);
+            auditLog->setNtpSync(now);
+            ntpInitialized = true;
+
+            char timeStr[32];
+            strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+            Serial.printf("NTP synced: %s\n", timeStr);
+        } else {
+            Serial.println("NTP sync failed");
+        }
+    }
+
+    bool isConnected() {
+        return connected;
+    }
+
+    bool isAPMode() {
+        return apMode;
+    }
+
+    int getRSSI() {
+        return WiFi.RSSI();
+    }
+
+    // Clear stored credentials (for reset)
+    void clearCredentials() {
+        wifiPrefs.begin("wificreds", false);
+        wifiPrefs.clear();
+        wifiPrefs.end();
+        configured = false;
+        Serial.println("WiFi credentials cleared");
     }
 };
 
-#endif // WEB_SERVER_H
+#endif // WIFI_MANAGER_H
