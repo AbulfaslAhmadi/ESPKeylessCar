@@ -57,7 +57,7 @@ const int UNLOCK_BUTTON_PIN = 18;
 #define CHARACTERISTIC_UUID         "2A37"  // Heart Rate Measurement
 
 // Keyless system parameters
-const int SCAN_TIME = 3;
+const int SCAN_TIME = 2;  // Reduced from 3s for faster detection (now ~2.3s cycle)
 // Default values - actual values loaded from storage.settings
 unsigned long PROXIMITY_TIMEOUT = 10000;      // Fallback re-arm if BLE adverts simply stop
 int RSSI_TRIGGER_THRESHOLD = -80;             // Single threshold: pins fire once RSSI rises above this
@@ -923,6 +923,6 @@ void loop() {
         setLED(pinsActive || anyPhoneNearby);
         
         pBLEScan->clearResults();
-        delay(500);
+        delay(300);  // Reduced from 500ms for faster loop cycles (~2.3s total)
     }
 }
