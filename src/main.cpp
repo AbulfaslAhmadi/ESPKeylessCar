@@ -59,12 +59,9 @@ const int UNLOCK_BUTTON_PIN = 18;
 // Keyless system parameters
 const int SCAN_TIME = 3;
 // Default values - actual values loaded from storage.settings
-unsigned long PROXIMITY_TIMEOUT = 10000;
-int RSSI_UNLOCK_THRESHOLD = -90;  // Öffnen bei schwächerem Signal (größere Reichweite)
-int RSSI_LOCK_THRESHOLD = -80;    // Schließen bei stärkerem Signal (kleinere Reichweite)
-const unsigned long POWER_OFF_DELAY = 10000;
-const unsigned long UNLOCK_DELAY = 500;
-const unsigned long LOCK_STABILIZATION_DELAY = 10;
+unsigned long PROXIMITY_TIMEOUT = 10000;      // Fallback re-arm if BLE adverts simply stop
+int RSSI_TRIGGER_THRESHOLD = -80;             // Single threshold: pins fire once RSSI rises above this
+unsigned long TRIGGER_DURATION_MS = 3000;     // How long the pins stay HIGH (1000-10000 ms, web-configurable)
 
 // Hysteresis parameters - WEAK_SIGNAL_THRESHOLD loaded from storage.settings
 int WEAK_SIGNAL_THRESHOLD = 3;
@@ -110,14 +107,17 @@ int numKnownDevices = 0;
 
 // Keyless system state
 volatile unsigned long lastSeenTime[MAX_DEVICES] = {0};
-volatile bool deviceNearby[MAX_DEVICES] = {false};
+volatile bool deviceNearby[MAX_DEVICES] = {false};   // "nearby" = RSSI currently above threshold
 volatile bool anyPhoneNearby = false;
-volatile bool keyPowered = false;
-volatile bool lockTriggered = false;
-volatile bool unlockTriggered = false;
-volatile bool pendingLock = false;
-volatile unsigned long keyPowerTime = 0;
-volatile unsigned long lockTriggerTime = 0;
+
+// Single-shot pin trigger state machine:
+// - armed=true  -> next time a known device crosses the threshold, pins fire once
+// - pinsActive=true -> pins are currently HIGH, waiting for TRIGGER_DURATION_MS to elapse
+// - armed only becomes true again once ALL known devices have dropped back below
+//   the threshold (so it fires once per approach, not on every scan while in range)
+volatile bool armed = true;
+volatile bool pinsActive = false;
+volatile unsigned long pinsActiveSince = 0;
 
 // Hysteresis per device
 struct DeviceHysteresis {
@@ -311,64 +311,54 @@ int verifyRPA(const uint8_t* rpaAddress) {
 // KEYLESS SYSTEM FUNCTIONS
 // ========================================
 
-void activateKeyPower() {
-    if (!keyPowered) {
-        digitalWrite(KEY_POWER_PIN, HIGH);
-        keyPowered = true;
-        keyPowerTime = millis();
-        Serial.println("🔌 Key power activated");
-    }
-}
-
-void deactivateKeyPower() {
-    if (keyPowered) {
-        digitalWrite(KEY_POWER_PIN, LOW);
-        keyPowered = false;
-        Serial.println("🔌 Key power deactivated");
-    }
-}
-
-void triggerLock() {
+// Fires all three output pins HIGH at once. Called exactly once per approach
+// (guarded by `armed` so continuous strong RSSI doesn't refire it every scan).
+void firePins(int deviceIndex, int rssi) {
+    digitalWrite(KEY_POWER_PIN, HIGH);
     digitalWrite(LOCK_BUTTON_PIN, HIGH);
-    delay(100);
-    digitalWrite(LOCK_BUTTON_PIN, LOW);
-    lockTriggered = true;
-    lockTriggerTime = millis();
-    Serial.println("🔒 Lock triggered");
+    digitalWrite(UNLOCK_BUTTON_PIN, HIGH);
 
-    // Log lock event
-    if (lastUnlockDevice >= 0 && lastUnlockDevice < numKnownDevices) {
-        auditLog.logEvent(lastUnlockDevice, ACTION_LOCK, -99);
+    pinsActive = true;
+    pinsActiveSince = millis();
+    armed = false; // don't fire again until device drops below threshold and re-arms
+
+    Serial.printf("⚡ Threshold reached (RSSI %d) - pins HIGH for %lums\n", rssi, TRIGGER_DURATION_MS);
+
+    lastUnlockDevice = deviceIndex;
+    if (deviceIndex >= 0 && deviceIndex < numKnownDevices) {
+        auditLog.logEvent(deviceIndex, ACTION_UNLOCK, rssi); // "Unlock" = pins went HIGH
     }
 }
 
-void triggerUnlock() {
-    digitalWrite(UNLOCK_BUTTON_PIN, HIGH);
-    delay(100);
+// Releases the pins after TRIGGER_DURATION_MS has elapsed. Does NOT re-arm by
+// itself - re-arming only happens once the device(s) have actually left range,
+// see handleAllDevicesBelowThreshold().
+void releasePins() {
+    digitalWrite(KEY_POWER_PIN, LOW);
+    digitalWrite(LOCK_BUTTON_PIN, LOW);
     digitalWrite(UNLOCK_BUTTON_PIN, LOW);
-    unlockTriggered = true;
-    Serial.println("🔓 Unlock triggered");
 
-    // Log unlock event (device and RSSI set by scan callback)
+    pinsActive = false;
+    Serial.println("⚡ Trigger duration elapsed - pins LOW again");
+
+    if (lastUnlockDevice >= 0 && lastUnlockDevice < numKnownDevices) {
+        auditLog.logEvent(lastUnlockDevice, ACTION_LOCK, -99); // "Lock" = pins went LOW
+    }
 }
 
-void handleAllPhonesGone(const char* reason) {
+// Called once every known device has dropped back below the threshold.
+// Re-arms the system so the next approach can fire the pins again.
+void handleAllDevicesBelowThreshold(const char* reason) {
     anyPhoneNearby = false;
     for (int i = 0; i < numKnownDevices; i++) {
         deviceNearby[i] = false;
         deviceHysteresis[i].weakSignalCount = 0;
         deviceHysteresis[i].isWeak = false;
     }
-    
+
     setLED(false);
-    Serial.printf("📱 All phones gone (%s)\n", reason);
-    
-    if (!lockTriggered && !pendingLock) {
-        lockTriggerTime = millis() + LOCK_STABILIZATION_DELAY;
-        pendingLock = true;
-        unlockTriggered = true;
-        Serial.println("🔒 Lock scheduled");
-    }
+    Serial.printf("📱 All devices below threshold (%s) - re-armed\n", reason);
+    armed = true;
 }
 
 // ========================================
@@ -508,17 +498,16 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
             int matchedDevice = verifyRPA((uint8_t*)(*addr));
             if (matchedDevice >= 0) {
                 int rssi = advertisedDevice.getRSSI();
-                const char* deviceName = knownDevices[matchedDevice].name;
-                
-                // Check for unlock (more sensitive, longer range)
-                if (rssi > RSSI_UNLOCK_THRESHOLD) {
+
+                // Single threshold: RSSI above it = "in range", at/below it = "out of range"
+                if (rssi > RSSI_TRIGGER_THRESHOLD) {
                     lastSeenTime[matchedDevice] = millis();
                     deviceHysteresis[matchedDevice].weakSignalCount = 0;
                     deviceHysteresis[matchedDevice].isWeak = false;
-                    
+
                     bool wasAnyPhoneNearby = anyPhoneNearby;
                     deviceNearby[matchedDevice] = true;
-                    
+
                     // Update overall status
                     anyPhoneNearby = false;
                     for (int i = 0; i < numKnownDevices; i++) {
@@ -527,32 +516,28 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
                             break;
                         }
                     }
-                    
-                    // Removed frequent serial output to prevent TX buffer blocking WiFi
 
-                    // Immediate unlock on first strong signal
                     if (!wasAnyPhoneNearby && anyPhoneNearby) {
                         setLED(true);
-                        activateKeyPower();
-                        lockTriggered = false;
-                        unlockTriggered = false;
-                        pendingLock = false;
-                        lastUnlockDevice = matchedDevice;  // Track device for logging
-                        auditLog.logEvent(matchedDevice, ACTION_UNLOCK, rssi);  // Log unlock
-                        Serial.println("🔓 Welcome! Activating unlock sequence...");
+                        Serial.println("📶 Device in range");
                     }
-                } else if (rssi <= RSSI_LOCK_THRESHOLD) {
-                    // Check for lock (less sensitive, shorter range)
-                    // Weak signal hysteresis
+
+                    // Fire the pins exactly once per approach, only while re-armed
+                    if (armed && !pinsActive) {
+                        firePins(matchedDevice, rssi);
+                    }
+                } else {
+                    // Below/at threshold: weak-signal hysteresis before declaring "gone",
+                    // so a single noisy reading doesn't re-arm/disarm the trigger.
                     if (millis() - deviceHysteresis[matchedDevice].lastWeakSignalTime > WEAK_SIGNAL_RESET_TIME) {
                         deviceHysteresis[matchedDevice].weakSignalCount = 0;
                     }
                     deviceHysteresis[matchedDevice].lastWeakSignalTime = millis();
-                    
+
                     if (++deviceHysteresis[matchedDevice].weakSignalCount >= WEAK_SIGNAL_THRESHOLD) {
                         deviceHysteresis[matchedDevice].isWeak = true;
                         deviceNearby[matchedDevice] = false;
-                        
+
                         // Update overall status
                         anyPhoneNearby = false;
                         for (int i = 0; i < numKnownDevices; i++) {
@@ -561,18 +546,10 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
                                 break;
                             }
                         }
-                        
-                        // Removed: Serial output blocked WiFi when no monitor connected
 
                         if (!anyPhoneNearby) {
-                            handleAllPhonesGone("weak signal hysteresis");
+                            handleAllDevicesBelowThreshold("weak signal hysteresis");
                         }
-                    }
-                } else {
-                    // RSSI between -90 and -80: Maintain current state, update last seen time
-                    if (deviceNearby[matchedDevice]) {
-                        lastSeenTime[matchedDevice] = millis();
-                        // Removed: Serial output blocked WiFi when no monitor connected
                     }
                 }
             }
@@ -764,9 +741,9 @@ void setup() {
 
     // Load settings from NVS and apply to global variables
     storage.loadSettings();
-    RSSI_UNLOCK_THRESHOLD = storage.settings.rssiUnlockThreshold;
-    RSSI_LOCK_THRESHOLD = storage.settings.rssiLockThreshold;
-    PROXIMITY_TIMEOUT = storage.settings.proximityTimeout * 1000UL;  // Convert to ms
+    RSSI_TRIGGER_THRESHOLD = storage.settings.rssiTriggerThreshold;
+    TRIGGER_DURATION_MS = storage.settings.triggerDurationSec * 1000UL; // Convert to ms
+    PROXIMITY_TIMEOUT = storage.settings.proximityTimeout * 1000UL;     // Convert to ms
     WEAK_SIGNAL_THRESHOLD = storage.settings.weakSignalThreshold;
 
     // Initialize pins
@@ -932,31 +909,18 @@ void loop() {
                 }
                 
                 if (!anyPhoneNearby) {
-                    handleAllPhonesGone("device timeout");
+                    handleAllDevicesBelowThreshold("device timeout");
                 }
             }
         }
         
-        // Execute pending lock
-        if (pendingLock && millis() >= lockTriggerTime) {
-            triggerLock();
-            pendingLock = false;
+        // Release the pins once the configured trigger duration has elapsed
+        if (pinsActive && (millis() - pinsActiveSince >= TRIGGER_DURATION_MS)) {
+            releasePins();
         }
-        
-        // Trigger unlock after delay
-        if (anyPhoneNearby && keyPowered && !unlockTriggered && 
-            (millis() - keyPowerTime >= UNLOCK_DELAY)) {
-            triggerUnlock();
-        }
-        
-        // Turn off key power after lock
-        if (lockTriggered && (millis() - lockTriggerTime >= POWER_OFF_DELAY)) {
-            deactivateKeyPower();
-            lockTriggered = false;
-        }
-        
-        // LED status: ON when phones nearby, OFF when not
-        setLED(anyPhoneNearby);
+
+        // LED status: ON while pins are active, otherwise reflect "in range" state
+        setLED(pinsActive || anyPhoneNearby);
         
         pBLEScan->clearResults();
         delay(500);
