@@ -12,8 +12,8 @@
 #include "wifi_manager.h"
 
 // External references to global settings variables in main.cpp
-extern int RSSI_UNLOCK_THRESHOLD;
-extern int RSSI_LOCK_THRESHOLD;
+extern int RSSI_TRIGGER_THRESHOLD;
+extern unsigned long TRIGGER_DURATION_MS;
 extern unsigned long PROXIMITY_TIMEOUT;
 extern int WEAK_SIGNAL_THRESHOLD;
 
@@ -69,24 +69,24 @@ h2{font-size:1.1em;margin:20px 0 10px;color:#7b2cbf}
 <h2>Settings</h2>
 <div class="card" id="settings">
 <div class="setting">
-<label>Unlock RSSI Threshold <span class="val" id="v1">-90</span> dBm</label>
-<input type="range" id="s1" min="-100" max="-50" value="-90" oninput="$('v1').textContent=this.value">
-<small>Signal strength to trigger unlock (lower = longer range)</small>
+<label>Trigger RSSI Threshold <span class="val" id="v1">-80</span> dBm</label>
+<input type="range" id="s1" min="-100" max="-50" value="-80" oninput="$('v1').textContent=this.value">
+<small>Signal strength that fires the pins once (lower = longer range)</small>
 </div>
 <div class="setting">
-<label>Lock RSSI Threshold <span class="val" id="v2">-80</span> dBm</label>
-<input type="range" id="s2" min="-100" max="-50" value="-80" oninput="$('v2').textContent=this.value">
-<small>Signal strength to trigger lock (higher = must be further away)</small>
+<label>Trigger Duration <span class="val" id="v2">3</span> sec</label>
+<input type="range" id="s2" min="1" max="10" value="3" oninput="$('v2').textContent=this.value">
+<small>How long the pins stay HIGH after firing (1-10 sec)</small>
 </div>
 <div class="setting">
-<label>Lock Timeout <span class="val" id="v3">10</span> sec</label>
+<label>Device Timeout <span class="val" id="v3">10</span> sec</label>
 <input type="range" id="s3" min="5" max="60" value="10" oninput="$('v3').textContent=this.value">
-<small>Time after last detection before locking</small>
+<small>Fallback: re-arm if no BLE advert is seen for this long</small>
 </div>
 <div class="setting">
 <label>Weak Signal Count <span class="val" id="v4">3</span></label>
 <input type="range" id="s4" min="1" max="10" value="3" oninput="$('v4').textContent=this.value">
-<small>Number of weak signals before triggering lock</small>
+<small>Number of weak readings before re-arming for the next approach</small>
 </div>
 <button class="btn btn-save" onclick="saveSettings()" style="width:100%;margin-top:8px">Save Settings</button>
 </div>
@@ -123,8 +123,8 @@ h+='<span class="log-rssi">'+e.rssi+'dB</span></div>';
 $('log').innerHTML=h||'<div class="empty">No activity yet</div>';
 });
 fetch('/api/settings').then(r=>r.json()).then(d=>{
-$('s1').value=d.rssiUnlock;$('v1').textContent=d.rssiUnlock;
-$('s2').value=d.rssiLock;$('v2').textContent=d.rssiLock;
+$('s1').value=d.rssiTrigger;$('v1').textContent=d.rssiTrigger;
+$('s2').value=d.triggerDuration;$('v2').textContent=d.triggerDuration;
 $('s3').value=d.timeout;$('v3').textContent=d.timeout;
 $('s4').value=d.weakCount;$('v4').textContent=d.weakCount;
 });
@@ -139,7 +139,7 @@ if(!confirm('Delete this device?'))return;
 fetch('/api/devices/'+i,{method:'DELETE'}).then(r=>{if(r.ok)msg('Deleted');load();});
 }
 function saveSettings(){
-let body='rssiUnlock='+$('s1').value+'&rssiLock='+$('s2').value+'&timeout='+$('s3').value+'&weakCount='+$('s4').value;
+let body='rssiTrigger='+$('s1').value+'&triggerDuration='+$('s2').value+'&timeout='+$('s3').value+'&weakCount='+$('s4').value;
 fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
 .then(r=>{if(r.ok)msg('Settings saved!');else msg('Error');});
 }
@@ -235,10 +235,10 @@ public:
         // API: Get settings
         server.on("/api/settings", HTTP_GET, [this]() {
             String json = "{";
-            json += "\"rssiUnlock\":";
-            json += storage->settings.rssiUnlockThreshold;
-            json += ",\"rssiLock\":";
-            json += storage->settings.rssiLockThreshold;
+            json += "\"rssiTrigger\":";
+            json += storage->settings.rssiTriggerThreshold;
+            json += ",\"triggerDuration\":";
+            json += storage->settings.triggerDurationSec;
             json += ",\"timeout\":";
             json += storage->settings.proximityTimeout;
             json += ",\"weakCount\":";
@@ -251,12 +251,15 @@ public:
         server.on("/api/settings", HTTP_POST, [this]() {
             bool changed = false;
 
-            if (server.hasArg("rssiUnlock")) {
-                storage->settings.rssiUnlockThreshold = server.arg("rssiUnlock").toInt();
+            if (server.hasArg("rssiTrigger")) {
+                storage->settings.rssiTriggerThreshold = server.arg("rssiTrigger").toInt();
                 changed = true;
             }
-            if (server.hasArg("rssiLock")) {
-                storage->settings.rssiLockThreshold = server.arg("rssiLock").toInt();
+            if (server.hasArg("triggerDuration")) {
+                int d = server.arg("triggerDuration").toInt();
+                if (d < 1) d = 1;
+                if (d > 10) d = 10; // hard-clamped to the 1-10 sec range
+                storage->settings.triggerDurationSec = d;
                 changed = true;
             }
             if (server.hasArg("timeout")) {
@@ -272,14 +275,14 @@ public:
                 storage->saveSettings();
 
                 // Apply settings to global variables immediately
-                RSSI_UNLOCK_THRESHOLD = storage->settings.rssiUnlockThreshold;
-                RSSI_LOCK_THRESHOLD = storage->settings.rssiLockThreshold;
+                RSSI_TRIGGER_THRESHOLD = storage->settings.rssiTriggerThreshold;
+                TRIGGER_DURATION_MS = storage->settings.triggerDurationSec * 1000UL;
                 PROXIMITY_TIMEOUT = storage->settings.proximityTimeout * 1000UL;
                 WEAK_SIGNAL_THRESHOLD = storage->settings.weakSignalThreshold;
 
-                Serial.printf("Settings applied: Unlock=%d, Lock=%d, Timeout=%lums, WeakThr=%d\n",
-                    RSSI_UNLOCK_THRESHOLD,
-                    RSSI_LOCK_THRESHOLD,
+                Serial.printf("Settings applied: Trigger=%d, Duration=%lums, Timeout=%lums, WeakThr=%d\n",
+                    RSSI_TRIGGER_THRESHOLD,
+                    TRIGGER_DURATION_MS,
                     PROXIMITY_TIMEOUT,
                     WEAK_SIGNAL_THRESHOLD);
                 server.send(200, "application/json", "{\"success\":true}");
