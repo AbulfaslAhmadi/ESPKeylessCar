@@ -30,10 +30,10 @@ struct LogEntry {
 
 // Settings structure
 struct KeylessSettings {
-    int8_t rssiUnlockThreshold;   // Default: -90
-    int8_t rssiLockThreshold;     // Default: -80
-    uint8_t proximityTimeout;     // Default: 10 (seconds)
-    uint8_t weakSignalThreshold;  // Default: 3
+    int8_t rssiTriggerThreshold;  // Default: -80 (single threshold, replaces old unlock/lock pair)
+    uint8_t triggerDurationSec;   // Default: 3 (seconds the pins stay HIGH, 1-10)
+    uint8_t proximityTimeout;     // Default: 10 (seconds, fallback re-arm if BLE adverts stop)
+    uint8_t weakSignalThreshold;  // Default: 3 (hysteresis before re-arming)
 };
 
 class Storage {
@@ -49,7 +49,7 @@ public:
     uint8_t logCount = 0;   // Total entries (max 50)
 
     // Settings with defaults
-    KeylessSettings settings = {-90, -80, 10, 3};
+    KeylessSettings settings = {-80, 3, 10, 3};
 
     bool begin() {
         return prefs.begin("keyless", false);
@@ -197,21 +197,25 @@ public:
     // ========== Settings Storage ==========
 
     void loadSettings() {
-        settings.rssiUnlockThreshold = prefs.getChar("rssiUnlock", -90);
-        settings.rssiLockThreshold = prefs.getChar("rssiLock", -80);
+        // "rssiUnlock" key reused on purpose so existing installs migrate their old
+        // unlock threshold into the new single trigger threshold automatically.
+        settings.rssiTriggerThreshold = prefs.getChar("rssiUnlock", -80);
+        settings.triggerDurationSec = prefs.getUChar("trigDur", 3);
+        if (settings.triggerDurationSec < 1) settings.triggerDurationSec = 1;
+        if (settings.triggerDurationSec > 10) settings.triggerDurationSec = 10;
         settings.proximityTimeout = prefs.getUChar("proxTimeout", 10);
         settings.weakSignalThreshold = prefs.getUChar("weakSigThr", 3);
 
-        Serial.printf("Settings loaded: Unlock=%d, Lock=%d, Timeout=%d, WeakThr=%d\n",
-            settings.rssiUnlockThreshold,
-            settings.rssiLockThreshold,
+        Serial.printf("Settings loaded: Trigger=%d, Duration=%ds, Timeout=%d, WeakThr=%d\n",
+            settings.rssiTriggerThreshold,
+            settings.triggerDurationSec,
             settings.proximityTimeout,
             settings.weakSignalThreshold);
     }
 
     void saveSettings() {
-        prefs.putChar("rssiUnlock", settings.rssiUnlockThreshold);
-        prefs.putChar("rssiLock", settings.rssiLockThreshold);
+        prefs.putChar("rssiUnlock", settings.rssiTriggerThreshold);
+        prefs.putUChar("trigDur", settings.triggerDurationSec);
         prefs.putUChar("proxTimeout", settings.proximityTimeout);
         prefs.putUChar("weakSigThr", settings.weakSignalThreshold);
 
